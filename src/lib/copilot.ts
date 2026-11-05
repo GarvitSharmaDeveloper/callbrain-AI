@@ -21,7 +21,23 @@ export interface CopilotState {
   experts: { name: string; team: string; why: string }[];
   actions: { kind: "declare_incident" | "apply_tenant_flag" | "page_expert" | "request_refund"; label: string; detail: string }[];
   possible_issues: { title: string; detail: string; severity: "high" | "medium" | "low"; correlated_with: string; raised: boolean; sources: string[] }[];
+  /** Issues the customer has raised on this call, classified against live data. */
+  call_issues?: CallIssue[];
+  /** Troubleshooting options from company docs (shown when nothing has been raised). */
+  playbooks?: { topic: string; steps: string[]; source: string }[];
+  /** Live health of the areas we watch for this account. */
+  watch?: { area: string; ok: boolean; detail: string }[];
   engine?: "ai" | "rules";
+}
+
+export interface CallIssue {
+  key: string;
+  kind: "known" | "new";
+  title: string;
+  summary: string;
+  steps: string[];
+  script: string;
+  sources: string[];
 }
 
 export type CopilotEvent =
@@ -116,11 +132,10 @@ ${diagnostics(input.customerId, input.customerName).map((d) => `[tw:${d.id}] ${d
       onEvent({ type: "result", state: quick });
       return quick;
     }
-    // Live counts and the issue list come from Triggerware facts, not the model.
-    state.blast_radius = quick.blast_radius;
-    state.possible_issues = quick.possible_issues;
-    state.actions = (state.actions || []).filter((a) =>
-      a.kind === "request_refund" ? tp.billing : a.kind === "declare_incident" ? tp.login && quick.blast_radius.is_incident : a.kind === "apply_tenant_flag" ? tp.login : true);
+    void tp;
+    // Status, live counts, actions and guardrails come from Triggerware facts; the AI only refines the wording.
+    const openEnded = quick.call_issues?.some((i) => i.key === "other");
+    state = { ...quick, suggested_reply: openEnded && state.suggested_reply ? state.suggested_reply : quick.suggested_reply, engine: "ai" };
     onEvent({ type: "result", state });
   } catch {
     /* keep the rule-based answer already sent */
@@ -162,6 +177,7 @@ export function topicsOf(transcript: TranscriptLine[]) {
     credit: /credit|compensat|discount/.test(text),
     eta: /when|fixed|eta|how long/.test(text),
     angry: /cfo|unacceptable|ridiculous|sitting idle|costing|again/.test(text),
+    problem: /error|not working|broken|can'?t|cannot|unable|problem|issue|slow|missing|wrong|down|crash|stuck|delay|late|fail|blank|stopped|won'?t|doesn'?t|isn'?t|didn'?t|haven'?t (received|got)|never (arrived|came)|outage|bug|glitch|freez|timeout|timing out|disappear|lost/.test(text),
   };
 }
 
@@ -255,5 +271,99 @@ export function ruleBased(input: { customerId: string; customerName: string; tra
   else if (etaTalk) st.suggested_reply = "Engineering is actively rolling back the change that caused this, and I'll personally update you the moment it's resolved. Meanwhile I've applied a workaround so your dispatchers can log in now, and your duplicate charge refund is filed. It'll arrive within 3 business days.";
   else if (creditTalk && credits.length) st.suggested_reply = "I understand this is costing you real money. I can't approve a second credit myself, but I'll take it to my manager today with the full impact. First, let me get your team logged back in right now.";
   else st.suggested_reply = `I'm really sorry. Your dispatchers being locked out during peak is serious. I can see exactly what's happening: ${authDeploy ? "a change we shipped this morning is rejecting Okta logins" : "logins are failing"}${dupes.length ? ", and yes, you were charged twice on your November invoice. That's our error and it'll be refunded in full" : ""}. Let me fix access first.`;
+  classify(st, tp, { topErr, spreadCount, authDeploy, dupes, openInc, credits, refunded, flagged, usageDrop, today, avg, openTickets: f.q11 || [] }, input);
   return st;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Call status: what the customer raised, matched against what live data already knows.
+// ---------------------------------------------------------------------------------------------
+const PLAYBOOKS = [
+  { topic: "Can't log in / SSO errors", source: "runbook-sso-saml", steps: ["Ask for the exact error text (assertion expired, signature invalid, ACS mismatch).", "Check if it's one user, the whole tenant, or many customers.", "Workaround: tenant flag saml_skew_override=300, or Admin magic-link login."] },
+  { topic: "Charged twice / billing", source: "runbook-billing-duplicate", steps: ["Look up payments on the invoice; two successful payments = duplicate.", "Orbit-caused duplicates are refunded in full, no approval (Refund Policy §2).", "Refund within 3 business days; never promise same-day."] },
+  { topic: "Asking for a credit", source: "policy-credits-sla", steps: ["Only after the outage is confirmed as Orbit-caused.", "Up to 10% of the monthly fee; one agent-approved credit per 90 days.", "Second credit within 90 days → Support Manager (Sam Ortiz)."] },
+  { topic: "Upset customer", source: "support-tone-guide", steps: ["Acknowledge the impact in their words first.", "Say what you know, what you're doing, and when they'll hear next.", "Never guess an ETA; close with explicit commitments and an owner."] },
+];
+
+function classify(
+  st: CopilotState,
+  tp: ReturnType<typeof topicsOf>,
+  f: { topErr?: Record<string, unknown>; spreadCount: number; authDeploy?: Record<string, unknown>; dupes: Record<string, unknown>[]; openInc?: Record<string, unknown>; credits: Record<string, unknown>[]; refunded: boolean; flagged: boolean; usageDrop: boolean; today?: number; avg: number; openTickets: Record<string, unknown>[] },
+  input: { customerName: string; transcript: TranscriptLine[] },
+) {
+  const issues: CallIssue[] = [];
+  const failures = Number(f.topErr?.failures || 0);
+
+  if (tp.login) {
+    if (failures >= 5 || (f.openInc && /sso|login|auth/i.test(String(f.openInc.title)))) {
+      const code = String(f.topErr?.error_code || "SSO error");
+      issues.push({
+        key: "login", kind: "known",
+        title: "Known issue: SSO login failures",
+        summary: `${failures} failed logins in the last hour (${code})${f.spreadCount >= 5 ? ` · same error at ${f.spreadCount} customers → incident` : ""}${f.authDeploy ? ` · caused by auth-service ${f.authDeploy.version} deployed this morning` : ""}.`,
+        steps: [
+          f.flagged ? "Workaround already applied (saml_skew_override=300): ask users to retry now." : "Apply the workaround: tenant flag saml_skew_override=300 (works within 60s).",
+          "Meanwhile admins can use Admin magic-link login (Settings → Security → Break-glass).",
+          f.spreadCount >= 5 ? "Incident policy: don't troubleshoot further, link the ticket to the incident, no ETAs." : "If it doesn't help, page Identity on-call (Leo Park).",
+        ],
+        script: `I can see exactly what's happening. A change we made this morning is rejecting Okta logins${f.spreadCount >= 5 ? ", and it's affecting other customers too, so it has our engineers' full attention" : ""}. I'm applying a workaround for your team right now so your dispatchers can get back in.`,
+        sources: ["tw:q1", "tw:q2", "tw:q3", "runbook-sso-saml"],
+      });
+    } else {
+      issues.push({
+        key: "login", kind: "new",
+        title: "New issue: customer can't log in",
+        summary: `Live data shows no login failures for ${input.customerName} in the last hour, so this is freshly reported. Treat it as new and gather details.`,
+        steps: ["Ask for the exact error text and one affected user's email.", "Ask: one user, a few, or the whole team? Since when?", "Try Admin magic-link login to unblock them; log a P2 and alert Identity on-call."],
+        script: "I'm sorry you're locked out. I know how disruptive that is. I'm going to stay on this with you. Can you tell me the exact error message you see, and whether it's everyone or just some users?",
+        sources: ["runbook-sso-saml", "support-tone-guide"],
+      });
+    }
+  }
+
+  if (tp.billing) {
+    const d = f.dupes[0];
+    if (d) {
+      issues.push({
+        key: "billing", kind: "known",
+        title: `Known issue: duplicate charge on ${d.invoice_id}`,
+        summary: `${d.charges} successful payments ($${Number(d.total).toLocaleString()} total) from the payment-retry bug.${f.refunded ? " Refund already issued." : ""}`,
+        steps: ["Confirm it: our retry job charged the invoice twice (known bug BILL-412).", "Refund the duplicate in full, no approval needed (Refund Policy §2).", "Refund lands in 3 business days; the invoice stays paid."],
+        script: "You're right, you were charged twice. That's our error, not yours. I'm refunding the duplicate in full right now; you'll see it within 3 business days, and your invoice stays paid.",
+        sources: ["tw:q4", "policy-refunds", "runbook-billing-duplicate"],
+      });
+    } else {
+      issues.push({
+        key: "billing", kind: "new",
+        title: "New issue: billing question",
+        summary: "No duplicate or failed payments in live data for this account, so this is freshly reported.",
+        steps: ["Ask which invoice and amount looks wrong.", "Compare with their latest payments; check for a card-side pending charge.", "If unresolved, open a billing ticket and promise a reply within 1 business day."],
+        script: "Thanks for flagging that. I want to get this right for you. Which invoice or charge looks off? I'll check it against our payment records while we talk.",
+        sources: ["runbook-billing-duplicate", "support-tone-guide"],
+      });
+    }
+  }
+
+  if (tp.problem && !tp.login && !tp.billing) {
+    const last = [...input.transcript].reverse().find((l) => l.speaker === "customer")?.text || "";
+    issues.push({
+      key: "other", kind: "new",
+      title: "New issue reported",
+      summary: `"${last.slice(0, 110)}${last.length > 110 ? "…" : ""}" No matching signal in live data yet.`,
+      steps: ["Acknowledge the impact and capture specifics: what, who, since when, error text.", "Check if other customers reported the same in the last hour.", "Log a ticket with priority by impact; tell them when they'll hear next."],
+      script: "I'm sorry this is happening. Thanks for your patience. Let me make sure I understand exactly what you're seeing, and I'll tell you exactly what I'm doing about it and when you'll hear from me.",
+      sources: ["support-tone-guide", "policy-incident-escalation"],
+    });
+  }
+
+  st.call_issues = issues;
+  st.playbooks = PLAYBOOKS;
+  st.watch = [
+    { area: "Logins", ok: failures < 5, detail: failures >= 5 ? `${failures} failures/1h` : "healthy" },
+    { area: "Billing", ok: !f.dupes.length, detail: f.dupes.length ? "duplicate charge" : "ok" },
+    { area: "Tickets", ok: !f.openTickets.some((t) => t.priority === "P1"), detail: f.openTickets.length ? `${f.openTickets.length} open` : "none open" },
+    { area: "Usage", ok: !f.usageDrop, detail: f.usageDrop && f.today !== undefined ? `${f.today} vs ${Math.round(f.avg)} avg` : "normal" },
+    { area: "Incidents", ok: !f.openInc, detail: f.openInc ? String(f.openInc.id) : "none" },
+  ];
+  if (issues.length) st.suggested_reply = issues[issues.length - 1].script;
 }

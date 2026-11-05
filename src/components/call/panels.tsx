@@ -1,12 +1,11 @@
 "use client";
 import clsx from "clsx";
 import {
-  AlertOctagon, AlertTriangle, BookOpen, CheckCircle2, CircleDot, Gauge, Lightbulb, Link2, Loader2, MessageSquareQuote, Radar,
-  Search, ShieldAlert, ShieldCheck, Siren, UserRoundSearch, Users, Wand2, Zap,
+  AlertTriangle, BookOpen, CheckCircle2, CircleDot, Gauge, Lightbulb, Loader2, ShieldAlert, ShieldCheck, Sparkles, Zap,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Briefing } from "@/lib/briefing";
-import type { CopilotState } from "@/lib/copilot";
+import type { CallIssue, CopilotState } from "@/lib/copilot";
 import { Badge, Button, Card, Skeleton, Sql, TwMark, fmtMoney } from "../ui";
 import type { Lookup } from "./lib";
 
@@ -83,7 +82,12 @@ export function BriefingPanel({ b, loading, docs }: { b: Briefing | null; loadin
           Mood: <Badge tone={moodTone[b.ai.mood]}>{b.ai.mood}</Badge>
         </div>
       </Card>
-      <Card title="Talking points" icon={<Lightbulb className="size-4 text-warn" />}>
+      <details className="group rounded-xl border border-line bg-surface">
+        <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-[13px] font-semibold">
+          <Lightbulb className="size-4 text-warn" /> Talking points
+          <span className="ml-auto text-[11px] font-normal text-faint group-open:hidden">show ▾</span>
+        </summary>
+        <div className="border-t border-line p-4">
         <ul className="space-y-1.5 text-[12.5px] leading-snug">
           {b.ai.talking_points.map((t, i) => <li key={i} className="flex gap-2"><CircleDot className="mt-0.5 size-3 shrink-0 text-brand" />{t}</li>)}
         </ul>
@@ -96,17 +100,9 @@ export function BriefingPanel({ b, loading, docs }: { b: Briefing | null; loadin
           </div>
         )}
         <Sources ids={b.ai.sources} docs={docs} />
-      </Card>
-      <Card title={<span className="flex items-center gap-1.5">Fetched live via <TwMark className="text-[13px]" /></span>}>
-        <ul className="space-y-1">
-          {b.queries.map((q) => (
-            <li key={q.label} className="flex items-center justify-between text-[11.5px]">
-              <span className="text-muted">{q.label}</span>
-              <span className="font-mono text-faint">{q.rows} rows · {q.ms}ms</span>
-            </li>
-          ))}
-        </ul>
-      </Card>
+        </div>
+      </details>
+      <p className="px-1 text-[11px] text-faint">Briefing built from {b.queries.length} live <TwMark className="text-[11px]" /> lookups in {Math.max(...b.queries.map((q) => q.ms))}ms.</p>
     </div>
   );
 }
@@ -122,168 +118,184 @@ function Stat({ label, value, sub, tone }: { label: string; value: string; sub?:
 }
 
 // ------------------------------------------------------------------------------------------
-// Right column: live copilot
+// Right column: live copilot — one clear status, updated with every line of the call.
 // ------------------------------------------------------------------------------------------
-const issueTone = { investigating: "warn", root_cause_found: "brand", workaround_available: "ok", resolved: "ok" } as const;
-
 export function CopilotPanel({
   state, thinking, docs, onLookup, onAction, onUseReply, actionBusy, actionsDone,
 }: {
   state: CopilotState | null; thinking: boolean; docs: Record<string, string>; onLookup: (id: string) => void;
   onAction: (a: CopilotState["actions"][number]) => void; onUseReply: (t: string) => void; actionBusy: string | null; actionsDone: string[];
 }) {
+  // Remember when each issue first appeared so freshly surfaced ones can be highlighted.
+  const [firstSeen, setFirstSeen] = useState<Record<string, number>>({});
+  const [, tick] = useState(0);
+  const issues = state?.call_issues || [];
+  const keys = issues.map((i) => `${i.key}:${i.kind}`).join("|");
+  useEffect(() => {
+    if (!keys) return;
+    setFirstSeen((m) => {
+      const next = { ...m };
+      for (const k of keys.split("|")) if (!next[k]) next[k] = Date.now();
+      return next;
+    });
+    const t = setTimeout(() => tick((n) => n + 1), 8000);
+    return () => clearTimeout(t);
+  }, [keys]);
+
   if (!state)
     return (
-      <Card title="Copilot" icon={<Wand2 className="size-4 text-brand" />}>
+      <Card>
         <div className="flex flex-col items-center gap-2 py-10 text-center">
-          {thinking ? <Loader2 className="size-5 animate-spin text-brand" /> : <MessageSquareQuote className="size-6 text-faint" />}
-          <p className="text-sm text-muted">{thinking ? "Listening and checking live data…" : "Listening. Insights appear as the customer talks."}</p>
+          <Loader2 className="size-5 animate-spin text-brand" />
+          <p className="text-sm text-muted">Checking live data for this account…</p>
         </div>
       </Card>
     );
-  const br = state.blast_radius;
+
+  const hasKnown = issues.some((i) => i.kind === "known");
+  const hasNew = issues.some((i) => i.kind === "new");
+  const headline = !issues.length ? "none" : hasKnown && hasNew ? "mixed" : hasKnown ? "known" : "new";
+
+  const actionsFor = (i: CallIssue): CopilotState["actions"] => {
+    if (i.kind === "new") return [{ kind: "page_expert", label: "Log ticket & alert the owner", detail: i.key === "login" ? "Identity on-call (Leo Park)" : i.key === "billing" ? "Billing Ops (Ana Gomez)" : "Support Manager (Sam Ortiz)" }];
+    const want = i.key === "login" ? ["apply_tenant_flag", "declare_incident", "page_expert"] : i.key === "billing" ? ["request_refund"] : [];
+    return state.actions.filter((a) => want.includes(a.kind));
+  };
+
   return (
     <div className="space-y-3">
-      {br && br.affected_customers > 1 && state.issues.length > 0 && (
-        <div className={clsx("slide-in rounded-xl border p-3", br.is_incident ? "border-bad/40 bg-bad-soft" : "border-warn/40 bg-warn-soft")}>
-          <div className={clsx("flex items-center gap-2 text-sm font-semibold", br.is_incident ? "text-bad" : "text-warn")}>
-            <Siren className="size-4" /> {br.is_incident ? "This is an incident, not a one-off" : "Other customers affected"}
-            <Badge tone={br.is_incident ? "bad" : "warn"} className="ml-auto"><Users className="size-3" /> {br.affected_customers} customers</Badge>
+      {/* Status header */}
+      <div
+        className={clsx(
+          "rounded-xl border p-3.5 transition-colors",
+          headline === "none" && "border-ok/40 bg-ok-soft",
+          headline === "known" && "border-warn/50 bg-warn-soft",
+          headline === "new" && "border-brand/50 bg-brand-soft",
+          headline === "mixed" && "border-bad/40 bg-bad-soft",
+        )}
+      >
+        <div className="flex items-center gap-2">
+          {headline === "none" ? <ShieldCheck className="size-5 text-ok" /> : headline === "new" ? <Sparkles className="size-5 text-brand" /> : <AlertTriangle className={clsx("size-5", headline === "known" ? "text-warn" : "text-bad")} />}
+          <div className="min-w-0 flex-1">
+            <div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted">Call status</div>
+            <div className="text-[15px] font-semibold leading-tight">
+              {headline === "none" && "No related issues"}
+              {headline === "known" && `Known issue${issues.length > 1 ? "s" : ""}: workaround available`}
+              {headline === "new" && "New issue: freshly reported"}
+              {headline === "mixed" && `${issues.length} issues: known + new`}
+            </div>
           </div>
-          <p className="mt-1 text-[12.5px] leading-snug">{br.summary}</p>
+          {thinking && <Loader2 className="size-4 animate-spin text-muted" />}
         </div>
-      )}
-
-      {state.suggested_reply && (
-        <div className="slide-in rounded-xl border border-brand/30 bg-brand-soft p-3">
-          <div className="mb-1 flex items-center justify-between">
-            <span className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wide text-brand">
-              Say next
-              {state.engine === "rules" ? (
-                <Badge tone="tw" className="normal-case tracking-normal">{thinking ? "live facts · AI refining…" : "live facts"}</Badge>
-              ) : (
-                <Badge tone="brand" className="normal-case tracking-normal">AI</Badge>
-              )}
-            </span>
-            <Button size="sm" variant="ghost" onClick={() => onUseReply(state.suggested_reply)}>Use</Button>
+        <p className="mt-1.5 text-[12px] leading-snug text-muted">
+          {headline === "none" ? "Nothing the customer has said matches a problem yet. Listening and checking live data on every line." : "Matched against live data from Triggerware on every line of the call."}
+        </p>
+        {state.watch && (
+          <div className="mt-2.5 flex flex-wrap gap-1">
+            {state.watch.map((w) => (
+              <span key={w.area} title={w.detail} className={clsx("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10.5px]", w.ok ? "border-line bg-surface text-muted" : "border-warn/40 bg-surface text-warn")}>
+                <span className={clsx("size-1.5 rounded-full", w.ok ? "bg-ok" : "bg-warn")} />
+                {w.area}{!w.ok && `: ${w.detail}`}
+              </span>
+            ))}
           </div>
-          <p className="text-[13px] leading-snug">“{state.suggested_reply}”</p>
-        </div>
-      )}
+        )}
+      </div>
 
-      {state.possible_issues?.length > 0 && (
-        <Card
-          title="Possible issues on this account"
-          icon={<Radar className="size-4 text-tw" />}
-          action={<span className="text-[10.5px] text-faint">from live data · {state.possible_issues.filter((p) => p.raised).length}/{state.possible_issues.length} raised</span>}
-        >
-          <ul className="space-y-2">
-            {state.possible_issues.map((p) => (
-              <li key={p.title} className={clsx("rounded-lg border px-2.5 py-2", p.raised ? "border-brand/40 bg-brand-soft" : "border-line")}>
-                <div className="flex items-start gap-2">
-                  <span className={clsx("mt-1.5 size-2 shrink-0 rounded-full", p.severity === "high" ? "bg-bad" : p.severity === "medium" ? "bg-warn" : "bg-faint")} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-start justify-between gap-2">
-                      <span className="text-[12.5px] font-medium leading-snug">{p.title}</span>
-                      {p.raised ? <Badge tone="brand">raised</Badge> : <Badge>not raised yet</Badge>}
-                    </div>
-                    <p className="text-[11.5px] leading-snug text-muted">{p.detail}</p>
-                    {p.correlated_with && <p className="mt-0.5 flex items-center gap-1 text-[11px] text-tw"><Link2 className="size-3 shrink-0" /> {p.correlated_with}</p>}
-                    <Sources ids={p.sources} docs={docs} onLookup={onLookup} />
-                  </div>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-
-      {state.issues.length > 0 && (
-        <Card title="Issues on this call" icon={<AlertOctagon className="size-4 text-bad" />} action={thinking ? <Loader2 className="size-3.5 animate-spin text-brand" /> : null}>
-          <ul className="space-y-2.5">
-            {state.issues.map((i) => (
-              <li key={i.title}>
-                <div className="flex items-start justify-between gap-2">
-                  <span className="text-[13px] font-medium leading-snug">{i.title}</span>
-                  <Badge tone={issueTone[i.status]}>{i.status.replace(/_/g, " ")}</Badge>
-                </div>
-                <p className="mt-0.5 text-[12px] leading-snug text-muted">{i.summary}</p>
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-
-      {state.diagnosis.length > 0 && (
-        <Card title="Live diagnosis" icon={<Search className="size-4 text-tw" />} tone="tw">
-          <ul className="space-y-3">
-            {state.diagnosis.map((d, i) => (
-              <li key={i} className="slide-in">
-                <p className="text-[13px] font-medium leading-snug">{d.finding}</p>
-                <p className="mt-0.5 text-[12px] leading-snug text-muted">{d.evidence}</p>
-                <Sources ids={d.sources} docs={docs} onLookup={onLookup} />
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-
-      {state.answer_cards.map((a) => (
-        <Card key={a.title} title={a.title} icon={<BookOpen className="size-4 text-brand" />}>
-          <ol className="space-y-1.5">
-            {a.steps.map((s, i) => (
-              <li key={i} className="flex gap-2 text-[12.5px] leading-snug">
-                <span className="mt-px grid size-4 shrink-0 place-items-center rounded-full bg-surface-2 text-[10px] font-semibold text-muted">{i + 1}</span>
-                {s}
-              </li>
-            ))}
-          </ol>
-          <Sources ids={a.sources} docs={docs} onLookup={onLookup} />
-        </Card>
-      ))}
-
-      {state.guardrails.length > 0 && (
-        <Card title="Guardrails" icon={<ShieldAlert className="size-4 text-warn" />}>
-          <ul className="space-y-2">
-            {state.guardrails.map((g, i) => (
-              <li key={i} className={clsx("rounded-lg border p-2 text-[12.5px] leading-snug", g.level === "block" ? "border-bad/30 bg-bad-soft" : g.level === "warn" ? "border-warn/30 bg-warn-soft" : "border-ok/30 bg-ok-soft")}>
-                <div className="flex gap-2">
-                  {g.level === "ok" ? <ShieldCheck className="mt-0.5 size-3.5 shrink-0 text-ok" /> : <ShieldAlert className={clsx("mt-0.5 size-3.5 shrink-0", g.level === "block" ? "text-bad" : "text-warn")} />}
-                  <span>{g.text}</span>
-                </div>
-                <Sources ids={g.sources} docs={docs} onLookup={onLookup} />
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-
-      {(state.actions.length > 0 || state.experts.length > 0) && (
-        <Card title="Do it now" icon={<Zap className="size-4 text-tw" />}>
-          <div className="flex flex-col gap-2">
-            {state.actions.map((a) => {
-              const done = actionsDone.includes(a.kind);
-              return (
-                <button key={a.kind + a.label} disabled={done || !!actionBusy} onClick={() => onAction(a)} className={clsx("flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors", done ? "border-ok/30 bg-ok-soft" : "border-line hover:border-brand/40 hover:bg-brand-soft")}>
-                  {actionBusy === a.kind ? <Loader2 className="mt-0.5 size-4 animate-spin text-brand" /> : done ? <CheckCircle2 className="mt-0.5 size-4 text-ok" /> : <Zap className="mt-0.5 size-4 text-tw" />}
-                  <span>
-                    <span className="block text-[13px] font-medium">{a.label}</span>
-                    <span className="block text-[11.5px] text-muted">{a.detail}</span>
-                  </span>
-                </button>
-              );
-            })}
-            {state.experts.map((e) => (
-              <div key={e.name} className="flex items-start gap-2 rounded-lg border border-dashed border-line px-3 py-2">
-                <UserRoundSearch className="mt-0.5 size-4 text-brand" />
-                <span>
-                  <span className="block text-[13px] font-medium">{e.name} <span className="font-normal text-faint">· {e.team}</span></span>
-                  <span className="block text-[11.5px] text-muted">{e.why}</span>
-                </span>
+      {/* One card per issue the customer raised */}
+      {issues.map((i) => {
+        const fresh = Date.now() - (firstSeen[`${i.key}:${i.kind}`] || 0) < 8000;
+        const acts = actionsFor(i);
+        return (
+          <section key={i.key} className={clsx("slide-in overflow-hidden rounded-xl border bg-surface", i.kind === "known" ? "border-warn/50" : "border-brand/50", fresh && "ring-2 ring-offset-1 ring-offset-bg", fresh && (i.kind === "known" ? "ring-warn/40" : "ring-brand/40"))}>
+            <header className={clsx("flex items-center gap-2 px-3.5 py-2", i.kind === "known" ? "bg-warn-soft" : "bg-brand-soft")}>
+              <Badge tone={i.kind === "known" ? "warn" : "brand"}>{i.kind === "known" ? "KNOWN ISSUE" : "NEW ISSUE"}</Badge>
+              {fresh && <span className="text-[10.5px] font-semibold text-tw">● just surfaced</span>}
+            </header>
+            <div className="space-y-3 p-3.5">
+              <div>
+                <h3 className="text-[14px] font-semibold leading-snug">{i.title.replace(/^(Known issue|New issue): /, "")}</h3>
+                <p className="mt-0.5 text-[12.5px] leading-snug text-muted">{i.summary}</p>
               </div>
+              <div>
+                <div className="mb-1 text-[10.5px] font-semibold uppercase tracking-wide text-faint">{i.kind === "known" ? "Workaround" : "Next steps"}</div>
+                <ol className="space-y-1">
+                  {i.steps.map((st, n) => (
+                    <li key={n} className="flex gap-2 text-[12.5px] leading-snug">
+                      <span className="mt-px grid size-4 shrink-0 place-items-center rounded-full bg-surface-2 text-[10px] font-semibold text-muted">{n + 1}</span>
+                      {st}
+                    </li>
+                  ))}
+                </ol>
+              </div>
+              <div className="rounded-lg border border-line bg-surface-2 p-2.5">
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-[10.5px] font-semibold uppercase tracking-wide text-faint">{i.kind === "known" ? "Say this" : "Calm & reassure"}</span>
+                  <Button size="sm" variant="ghost" onClick={() => onUseReply(i.script)}>Use</Button>
+                </div>
+                <p className="text-[13px] leading-snug">“{i.script}”</p>
+              </div>
+              {acts.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {acts.map((a) => {
+                    const done = actionsDone.includes(a.kind);
+                    return (
+                      <Button key={a.kind + a.label} size="sm" variant={done ? "secondary" : i.kind === "known" ? "tw" : "primary"} disabled={done || !!actionBusy} loading={actionBusy === a.kind} onClick={() => onAction(a)}>
+                        {done ? <CheckCircle2 className="size-3.5 text-ok" /> : <Zap className="size-3.5" />} {a.label}
+                      </Button>
+                    );
+                  })}
+                </div>
+              )}
+              <Sources ids={i.sources} docs={docs} onLookup={onLookup} />
+            </div>
+          </section>
+        );
+      })}
+
+      {/* Guardrails only when something applies */}
+      {issues.length > 0 && state.guardrails.length > 0 && (
+        <Card title="Don't promise" icon={<ShieldAlert className="size-4 text-bad" />}>
+          <ul className="space-y-1.5">
+            {state.guardrails.map((g, n) => (
+              <li key={n} className="flex gap-2 text-[12.5px] leading-snug">
+                <ShieldAlert className={clsx("mt-0.5 size-3.5 shrink-0", g.level === "block" ? "text-bad" : "text-warn")} />
+                {g.text}
+              </li>
             ))}
-          </div>
+          </ul>
         </Card>
+      )}
+
+      {/* No issues: what to say + troubleshooting options from company docs */}
+      {!issues.length && (
+        <>
+          {state.suggested_reply && (
+            <div className="rounded-xl border border-line bg-surface p-3">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-[10.5px] font-semibold uppercase tracking-wide text-faint">Say next</span>
+                <Button size="sm" variant="ghost" onClick={() => onUseReply(state.suggested_reply)}>Use</Button>
+              </div>
+              <p className="text-[13px] leading-snug">“{state.suggested_reply}”</p>
+            </div>
+          )}
+          <Card title="Troubleshooting options (from company docs)" icon={<BookOpen className="size-4 text-brand" />}>
+            <div className="space-y-1">
+              {(state.playbooks || []).map((p) => (
+                <details key={p.topic} className="group rounded-lg border border-line px-3 py-2 open:bg-surface-2">
+                  <summary className="cursor-pointer list-none text-[12.5px] font-medium">
+                    <span className="mr-1.5 inline-block text-faint transition-transform group-open:rotate-90">›</span>
+                    If they say: {p.topic}
+                  </summary>
+                  <ol className="mt-1.5 space-y-1 pl-4">
+                    {p.steps.map((st, n) => <li key={n} className="list-decimal text-[12px] leading-snug text-muted">{st}</li>)}
+                  </ol>
+                  <div className="mt-1.5 text-[10.5px] text-faint"><BookOpen className="mr-1 inline size-3" />{docs[p.source] || p.source}</div>
+                </details>
+              ))}
+            </div>
+          </Card>
+        </>
       )}
     </div>
   );
@@ -294,6 +306,7 @@ export function CopilotPanel({
 // ------------------------------------------------------------------------------------------
 export function LookupsPanel({ lookups, highlight, onAsk }: { lookups: Lookup[]; highlight: string | null; onAsk?: (q: string) => Promise<void> }) {
   const [open, setOpen] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
   const [q, setQ] = useState("");
   const [asking, setAsking] = useState(false);
   const ask = async () => {
@@ -309,7 +322,11 @@ export function LookupsPanel({ lookups, highlight, onAsk }: { lookups: Lookup[];
   return (
     <Card
       title={<span className="flex items-center gap-1.5"><TwMark className="text-[13px]" label="Triggerware" /> live lookups</span>}
-      action={<span className="text-[11px] text-faint">{lookups.filter((l) => l.done).length} queries · {lookups.reduce((s, l) => s + (l.rowCount || 0), 0)} rows</span>}
+      action={
+        <button onClick={() => setExpanded(!expanded)} className="text-[11px] text-faint hover:text-fg">
+          {lookups.filter((l) => l.done).length} queries · {lookups.reduce((s, l) => s + (l.rowCount || 0), 0)} rows · {expanded ? "hide ▴" : "show ▾"}
+        </button>
+      }
       tone="tw"
     >
       {onAsk && (
@@ -322,7 +339,7 @@ export function LookupsPanel({ lookups, highlight, onAsk }: { lookups: Lookup[];
         <p className="py-2 text-center text-xs text-faint">The copilot will query live production data through Triggerware as the call unfolds.</p>
       ) : (
         <ul className="max-h-80 space-y-1.5 overflow-y-auto scroll-thin">
-          {lookups.map((l) => {
+          {(expanded || highlight ? lookups : lookups.filter((l) => l.id.includes("ask")).slice(0, 2)).map((l) => {
             const isOpen = open === l.id || highlight === l.id;
             return (
               <li key={l.id} id={`lookup-${l.id}`} className={clsx("slide-in rounded-lg border px-2.5 py-2", highlight === l.id ? "border-tw bg-tw-soft" : "border-line")}>
